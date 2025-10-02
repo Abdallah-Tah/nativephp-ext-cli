@@ -9,7 +9,7 @@ use ZipArchive;
 
 class InstallPhpExtensions extends Command
 {
-    protected $signature = 'php-ext:install {--php-version= : PHP version to build (8.1, 8.2, 8.3)} {--extensions= : Comma-separated list of extensions (or use interactive mode)}';
+    protected $signature = 'php-ext:install {--php-version= : PHP version to build (e.g., 8.3, 8.4, 8.3.13, 8.4.1)} {--extensions= : Comma-separated list of extensions (or use interactive mode)}';
 
     protected $description = 'Build a custom PHP binary with database and extension support for NativePHP';
 
@@ -707,18 +707,31 @@ class InstallPhpExtensions extends Command
         // Get PHP version from option or prompt user
         $phpVersion = $this->option('php-version');
         if (!$phpVersion) {
-            $this->info('Available PHP versions: 8.1, 8.2, 8.3');
+            $this->info('Common PHP versions: 8.1, 8.2, 8.3, 8.4');
             $this->warn('Note: PHP 8.4 does not support SQL Server extensions (sqlsrv, pdo_sqlsrv)');
+            $this->line('');
+            $this->line('You can select from the list below or enter a custom version (e.g., 8.3.13, 8.4.0):');
 
             $phpVersion = $this->choice(
                 'Select PHP version to build:',
-                ['8.1', '8.2', '8.3'],
+                ['8.1', '8.2', '8.3', '8.4', 'custom'],
                 '8.3'
             );
+
+            // If user selects custom, ask for specific version
+            if ($phpVersion === 'custom') {
+                $phpVersion = $this->ask('Enter PHP version (e.g., 8.3.13, 8.4.0, 8.4.1)');
+
+                // Validate format (should be X.Y or X.Y.Z)
+                if (!preg_match('/^(\d+)\.(\d+)(?:\.(\d+))?$/', $phpVersion)) {
+                    throw new RuntimeException('Invalid PHP version format. Use format: 8.3 or 8.3.13');
+                }
+            }
         }
 
-        if (!in_array($phpVersion, ['8.1', '8.2', '8.3'])) {
-            throw new RuntimeException('Unsupported PHP version. Supported versions: 8.1, 8.2, 8.3');
+        // Validate PHP version is supported (8.1+)
+        if (version_compare($phpVersion, '8.1', '<')) {
+            throw new RuntimeException('PHP version must be 8.1 or higher');
         }
 
         $this->selectedPhpVersion = $phpVersion;

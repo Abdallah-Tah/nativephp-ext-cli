@@ -1,5 +1,5 @@
 {
-    "name": "amohamed/pc",
+    "name": "amohamed/nativephp-ext-cli",
     "description": "Laravel package to install PHP extensions with NativePHP compatibility",
     "type": "library",
     "license": "MIT",
