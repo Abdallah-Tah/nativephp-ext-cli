@@ -22,3 +22,5 @@ yarn-error.log
 /.vscode
 /.zed
 /static-php-cli
+/.claude
+/CLAUDE.md
