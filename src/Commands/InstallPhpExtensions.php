@@ -2332,8 +2332,15 @@ class InstallPhpExtensions extends Command
                     "python \"{$pythonScript}\" \"{$extArchive}\" \"{$extDestination}\" 1"
                 );
 
-                if ($extractResult->successful()) {
-                    $this->info("  ✅ {$ext} extracted successfully");
+                // Check if extraction actually succeeded (Python may exit with error due to Unicode console issues)
+                $filesExtracted = file_exists($extDestination) && is_dir($extDestination) && count(glob($extDestination . '/*')) > 3;
+
+                if ($extractResult->successful() || $filesExtracted) {
+                    if (!$extractResult->successful() && $filesExtracted) {
+                        $this->info("  ✅ {$ext} extracted successfully (Python console error ignored)");
+                    } else {
+                        $this->info("  ✅ {$ext} extracted successfully");
+                    }
                     // Create hash file to prevent re-extraction
                     $this->createSourceHashFile($spcPath, 'php-src/ext/' . $ext, $extArchive);
                     $extracted++;
@@ -2404,22 +2411,26 @@ class InstallPhpExtensions extends Command
                 "python \"{$pythonScript}\" \"{$archive}\" \"{$destination}\" 1"
             );
 
-            if ($extractResult->successful() && file_exists($destination . '/' . $libInfo['check_file'])) {
+            // Check if extraction actually succeeded (even if Python exit code is non-zero due to Unicode console issues)
+            $filesCount = count(glob($destination . '/*'));
+            $hasCheckFile = file_exists($destination . '/' . $libInfo['check_file']);
+
+            if ($extractResult->successful() && $hasCheckFile) {
                 $this->info("  ✅ {$libName} extracted successfully");
-                // Create hash file to prevent re-extraction
                 $this->createSourceHashFile($spcPath, $libName, $archive);
-            } else {
-                // Check if extraction partially succeeded (symlinks skipped is OK)
-                $filesCount = count(glob($destination . '/*'));
-                if ($filesCount > 10) {
+            } elseif ($filesCount > 10) {
+                // Files were extracted despite Python error or missing check file
+                if (!$extractResult->successful()) {
+                    $this->info("  ✅ {$libName} extracted successfully (Python console error ignored)");
+                } else {
                     $this->warn("  ⚠️  {$libName} extracted but may be incomplete (symlinks skipped)");
                     $this->line("      This is usually OK for Windows builds");
-                    // Still create hash file to prevent re-extraction
-                    $this->createSourceHashFile($spcPath, $libName, $archive);
-                } else {
-                    $this->warn("  ❌ {$libName} extraction failed: " . $extractResult->errorOutput());
-                    $this->line("     static-php-cli will attempt extraction");
                 }
+                // Still create hash file to prevent re-extraction
+                $this->createSourceHashFile($spcPath, $libName, $archive);
+            } else {
+                $this->warn("  ❌ {$libName} extraction failed: " . $extractResult->errorOutput());
+                $this->line("     static-php-cli will attempt extraction");
             }
         }
     }

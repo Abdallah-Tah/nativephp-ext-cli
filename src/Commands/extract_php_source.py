@@ -87,10 +87,10 @@ def main():
     success = extract_tar_archive(archive_path, destination, strip_components)
 
     if success:
-        print("✅ Extraction completed successfully!")
+        print("[OK] Extraction completed successfully!")
         sys.exit(0)
     else:
-        print("❌ Extraction failed!", file=sys.stderr)
+        print("[FAILED] Extraction failed!", file=sys.stderr)
         sys.exit(1)
 
 if __name__ == '__main__':
