@@ -14,7 +14,19 @@ class InstallPhpExtensions extends Command
 
 {
 
-    protected $signature = 'php-ext:install {--php-version= : PHP version to build (e.g., 8.3, 8.4, 8.3.13, 8.4.1)} {--extensions= : Comma-separated list of extensions (or use interactive mode)} {--mode=nativephp : Build mode: nativephp (match NativePHP + add DB drivers) or custom (full customization)}';
+    protected $signature = 'php-ext:install
+        {--php-version= : PHP version to build (e.g., 8.3, 8.4, 8.3.13, 8.4.1)}
+        {--extensions= : Comma-separated list of extensions (or use interactive mode)}
+        {--pack=* : Named extension pack(s) to include (mysql, pgsql, sqlsrv, all)}
+        {--profile=slim : Build profile: slim (default) or full}
+        {--mode=nativephp : Build mode: nativephp (match NativePHP + add DB drivers) or custom (full customization)}
+        {--build-flag=* : Additional flags passed to static-php-cli}
+        {--dry-run : Resolve configuration and exit without building}
+        {--json : Emit machine-readable JSON output}
+        {--lockfile=.nativephp-ext.lock : Lockfile to read from and write to}
+        {--cache-dir= : Override cache directory}
+        {--no-cache : Skip artifact cache lookups and rebuild}
+    ';
 
     protected $description = 'Build a PHP binary matching NativePHP with additional database drivers (use --mode=custom for full customization)';
 
@@ -414,6 +426,76 @@ class InstallPhpExtensions extends Command
 
     protected array $requiredLibraries = [];
 
+    /**
+     * Build profile that controls additional extensions packaged in the artifact.
+     */
+    protected string $buildProfile = 'slim';
+
+    /**
+     * User requested extension packs (from CLI flags or lockfile).
+     */
+    protected array $requestedPacks = [];
+
+    /**
+     * Additional build flags passed through to static-php-cli.
+     */
+    protected array $additionalBuildFlags = [];
+
+    /**
+     * Whether the command should only resolve configuration without running a build.
+     */
+    protected bool $dryRun = false;
+
+    /**
+     * Whether JSON output should be emitted for machine consumption.
+     */
+    protected bool $jsonOutput = false;
+
+    /**
+     * The build matrix used for calculating deterministic build keys.
+     */
+    protected array $buildMatrix = [];
+
+    /**
+     * SHA-256 hash derived from the build matrix.
+     */
+    protected string $buildHash = '';
+
+    /**
+     * Directory used for storing cached artifacts and build metadata.
+     */
+    protected ?string $cacheDirectory = null;
+
+    /**
+     * Indicates whether the current execution resolved to a cached build.
+     */
+    protected bool $cacheHit = false;
+
+    /**
+     * Handle to the single-flight lock file when acquired.
+     */
+    protected $lockHandle = null;
+
+    /**
+     * Path to the lockfile that stores the last resolved build configuration.
+     */
+    protected string $lockfilePath = '';
+
+    /**
+     * Parsed contents of the lockfile (if present).
+     */
+    protected array $lockfileData = [];
+
+    /**
+     * Path to the cached artifact if the build was resolved from cache.
+     */
+    protected ?string $cachedArtifactPath = null;
+
+    /**
+     * Cached metadata payload for the current build key.
+     */
+    protected array $buildMetadata = [];
+
     // Default extensions - matches NativePHP php-bin exactly
     // This ensures compatibility and faster builds when using --mode=nativephp
     protected array $defaultExtensions = [
@@ -457,17 +539,131 @@ class InstallPhpExtensions extends Command
 
     {
 
+        $this->dryRun = (bool) $this->option('dry-run');
+
+        $this->jsonOutput = (bool) $this->option('json');
+
+        $this->lockfilePath = $this->resolveLockfilePath($this->option('lockfile'));
+
+        $this->loadLockfile();
+
+        $profileOption = $this->option('profile');
+
+        if (!$this->input->hasParameterOption('--profile') && isset($this->lockfileData['profile'])) {
+
+            $profileOption = $this->lockfileData['profile'];
+
+        }
+
+        $this->buildProfile = strtolower($profileOption ?? 'slim');
+
+        if (!in_array($this->buildProfile, ['slim', 'full'], true)) {
+
+            throw new RuntimeException("Invalid profile '{$this->buildProfile}'. Expected 'slim' or 'full'.");
+
+        }
+
+        $packOption = $this->normalizePackOptions($this->option('pack'));
+
+        if (!empty($packOption) || $this->input->hasParameterOption('--pack')) {
+
+            $this->requestedPacks = $packOption;
+
+        } elseif (isset($this->lockfileData['packs'])) {
+
+            $this->requestedPacks = $this->normalizePackOptions($this->lockfileData['packs']);
+
+        } else {
+
+            $this->requestedPacks = [];
+
+        }
+
+        $buildFlagOption = $this->normalizeBuildFlags($this->option('build-flag'));
+
+        if (!empty($buildFlagOption) || $this->input->hasParameterOption('--build-flag')) {
+
+            $this->additionalBuildFlags = $buildFlagOption;
+
+        } elseif (isset($this->lockfileData['build_flags'])) {
+
+            $this->additionalBuildFlags = $this->normalizeBuildFlags($this->lockfileData['build_flags']);
+
+        } else {
+
+            $this->additionalBuildFlags = [];
+
+        }
+
         $this->validateEnvironment();
 
         // Get user preferences
 
         $this->getUserPreferences();
 
+        $this->calculateBuildMatrix();
+
+        $this->buildHash = $this->computeBuildHash($this->buildMatrix);
+
+        $this->cacheDirectory = $this->resolveCacheDirectory($this->option('cache-dir'));
+
+        $cacheDisabled = (bool) $this->option('no-cache');
+
+        if (!$cacheDisabled) {
+
+            $this->checkCacheForBuild(true);
+
+        }
+
+        if ($this->dryRun) {
+
+            $this->info('Dry run enabled. Skipping build steps.');
+
+            $this->outputResolvedConfiguration();
+
+            $this->writeLockfile();
+
+            $this->emitJsonSummary('dry-run');
+
+            return self::SUCCESS;
+
+        }
+
+        if (!$cacheDisabled && ($this->cacheHit || $this->checkCacheForBuild())) {
+
+            $this->announceCacheHit();
+
+            $this->writeLockfile();
+
+            $this->emitJsonSummary('cache-hit');
+
+            return self::SUCCESS;
+
+        }
+
         // Set the path to static-php-cli at the Laravel project root
 
         $spcPath = base_path('static-php-cli');
 
+        $lockAcquired = false;
+
         try {
+
+            $this->acquireBuildLock();
+
+            $lockAcquired = true;
+
+            if (!$cacheDisabled && !$this->cacheHit && $this->checkCacheForBuild(true)) {
+
+                $this->announceCacheHit();
+
+                $this->writeLockfile();
+
+                $this->emitJsonSummary('cache-hit');
+
+                return self::SUCCESS;
+
+            }
 
             // STEP 1: Clone and setup static-php-cli
 
@@ -513,9 +709,29 @@ class InstallPhpExtensions extends Command
 
             if ($buildResult) {
 
+                $artifactInfo = $this->packageBuildArtifacts($spcPath);
+
+                if ($artifactInfo !== null) {
+
+                    $this->buildMetadata = array_merge($artifactInfo, [
+
+                        'build_key' => $this->buildHash,
+
+                        'matrix' => $this->buildMatrix,
+
+                    ]);
+
+                    $this->storeBuildMetadata($this->buildMetadata);
+
+                }
+
                 $this->info('✅ Build completed successfully!');
 
                 $this->displayBuildSummary($spcPath);
+
+                $this->writeLockfile();
+
+                $this->emitJsonSummary('built');
 
                 return self::SUCCESS;
 
@@ -523,13 +739,33 @@ class InstallPhpExtensions extends Command
 
             $this->error('❌ Build failed!');
 
+            $this->emitJsonSummary('build-failed', [
+
+                'error' => 'Build process did not complete successfully.',
+
+            ]);
+
             return self::FAILURE;
 
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
 
             $this->error('Error: ' . $e->getMessage());
 
+            $this->emitJsonSummary('error', [
+
+                'error' => $e->getMessage(),
+
+            ]);
+
             return self::FAILURE;
+
+        } finally {
+
+            if ($lockAcquired) {
+
+                $this->releaseBuildLock();
+
+            }
 
         }
 
@@ -1141,7 +1377,19 @@ class InstallPhpExtensions extends Command
 
         // Build command without --with-php (that's used in download phase)
 
-        $buildCmd = "php bin/spc build \"{$extensions}\" --build-cli --debug";
+        $flags = array_merge(['--build-cli', '--debug'], $this->additionalBuildFlags);
+
+        $flags = array_values(array_filter(array_unique($flags)));
+
+        $buildCmd = sprintf(
+
+            'php bin/spc build "%s" %s',
+
+            $extensions,
+
+            implode(' ', array_map(fn ($flag) => $flag, $flags))
+
+        );
 
         $this->line("Running build command: {$buildCmd}");
 
@@ -1333,9 +1581,19 @@ class InstallPhpExtensions extends Command
 
     {
 
-        // Get PHP version from option or prompt user
+        $lockDefaults = $this->lockfileData;
+
+        // Get PHP version from option, lockfile, or prompt user
 
         $phpVersion = $this->option('php-version');
+
+        if (!$this->input->hasParameterOption('--php-version') && empty($phpVersion) && isset($lockDefaults['php_version'])) {
+
+            $phpVersion = $lockDefaults['php_version'];
+
+            $this->info('Using PHP version from lockfile: ' . $phpVersion);
+
+        }
 
         if (!$phpVersion) {
 
@@ -1451,12 +1709,29 @@ class InstallPhpExtensions extends Command
         // Check build mode
         $buildMode = $this->option('mode') ?? 'nativephp';
 
-        // Get extensions from option or prompt user
+        // Get extensions from option, packs, lockfile, or prompt user
+        $requestedExtensions = [];
+
         $extensionsInput = $this->option('extensions');
 
         if ($extensionsInput) {
             $requestedExtensions = array_map('trim', explode(',', $extensionsInput));
-        } else {
+        }
+
+        if (!empty($this->requestedPacks)) {
+            $packExtensions = $this->resolveExtensionPacks($this->requestedPacks);
+            $requestedExtensions = array_merge($requestedExtensions, $packExtensions);
+        } elseif (empty($requestedExtensions) && isset($lockDefaults['packs'])) {
+            $packExtensions = $this->resolveExtensionPacks($this->normalizePackOptions($lockDefaults['packs']));
+            $requestedExtensions = array_merge($requestedExtensions, $packExtensions);
+        }
+
+        if (empty($requestedExtensions) && isset($lockDefaults['extensions']) && is_array($lockDefaults['extensions'])) {
+            $requestedExtensions = array_merge($requestedExtensions, $lockDefaults['extensions']);
+            $this->info('Using extensions from lockfile: ' . implode(', ', $lockDefaults['extensions']));
+        }
+
+        if (empty($requestedExtensions)) {
             $this->info('');
 
             if ($buildMode === 'nativephp') {
@@ -1476,6 +1751,7 @@ class InstallPhpExtensions extends Command
         // Always include default extensions (these are core extensions needed for most PHP applications)
 
         $this->selectedExtensions = array_unique(array_merge($this->defaultExtensions, $this->selectedExtensions));
+        sort($this->selectedExtensions);
 
         $this->info('Including default extensions: ' . implode(', ', $this->defaultExtensions));
 
@@ -2459,11 +2735,29 @@ class InstallPhpExtensions extends Command
 
     protected function displayBuildSummary(string $spcPath): void
 
-{
+    {
 
-    $this->info('=== Build Summary ===');
+        $this->info('=== Build Summary ===');
 
-    // Display version with clear resolution indicator
+        if ($this->buildHash !== '') {
+
+            $this->info('Build key: ' . $this->buildHash);
+
+        }
+
+        if (!empty($this->buildMetadata['artifact_path'])) {
+
+            $this->info('Artifact: ' . $this->buildMetadata['artifact_path']);
+
+            if (!empty($this->buildMetadata['checksum'])) {
+
+                $this->info('SHA-256: ' . $this->buildMetadata['checksum']);
+
+            }
+
+        }
+
+        // Display version with clear resolution indicator
     if ($this->selectedPhpExactVersion !== '' && $this->selectedPhpExactVersion !== $this->selectedPhpVersion) {
         $this->info("PHP Version: {$this->selectedPhpVersion} → {$this->selectedPhpExactVersion} (latest patch)");
     } else {
@@ -4726,6 +5020,886 @@ protected function ensureGitDependencies(string $spcPath): void
         } else {
 
             $this->warn("⚠️ Archive not found: {$archivePath}, cannot create hash file");
+
+        }
+
+    }
+
+    protected function normalizePackOptions($packs): array
+
+    {
+
+        if (is_string($packs) && $packs !== '') {
+
+            $packs = [$packs];
+
+        }
+
+        if (!is_array($packs)) {
+
+            return [];
+
+        }
+
+        $normalized = [];
+
+        foreach ($packs as $pack) {
+
+            if (!is_string($pack)) {
+
+                continue;
+
+            }
+
+            $pack = strtolower(trim($pack));
+
+            if ($pack === '') {
+
+                continue;
+
+            }
+
+            $normalized[] = $pack;
+
+        }
+
+        $normalized = array_values(array_unique($normalized));
+
+        sort($normalized);
+
+        return $normalized;
+
+    }
+
+    protected function normalizeBuildFlags($flags): array
+
+    {
+
+        if (is_string($flags) && $flags !== '') {
+
+            $flags = [$flags];
+
+        }
+
+        if (!is_array($flags)) {
+
+            return [];
+
+        }
+
+        $normalized = [];
+
+        foreach ($flags as $flag) {
+
+            if (!is_string($flag)) {
+
+                continue;
+
+            }
+
+            $flag = trim($flag);
+
+            if ($flag === '') {
+
+                continue;
+
+            }
+
+            $normalized[] = $flag;
+
+        }
+
+        return array_values(array_unique($normalized));
+
+    }
+
+    protected function resolveExtensionPacks(array $packs): array
+
+    {
+
+        $resolved = [];
+
+        foreach ($packs as $pack) {
+
+            $resolved = array_merge($resolved, $this->getExtensionPack($pack));
+
+        }
+
+        $resolved = array_values(array_unique($resolved));
+
+        sort($resolved);
+
+        return $resolved;
+
+    }
+
+    protected function resolveLockfilePath(?string $path): string
+
+    {
+
+        $path = $path ?: '.nativephp-ext.lock';
+
+        $isAbsolute = preg_match('/^(?:[A-Za-z]:\\\\|\\/)/', $path) === 1;
+
+        if (!$isAbsolute) {
+
+            $path = base_path($path);
+
+        }
+
+        return $path;
+
+    }
+
+    protected function loadLockfile(): void
+
+    {
+
+        if ($this->lockfilePath === '' || !file_exists($this->lockfilePath)) {
+
+            $this->lockfileData = [];
+
+            return;
+
+        }
+
+        $contents = @file_get_contents($this->lockfilePath);
+
+        if ($contents === false) {
+
+            $this->warn('Unable to read lockfile at ' . $this->lockfilePath);
+
+            $this->lockfileData = [];
+
+            return;
+
+        }
+
+        $data = json_decode($contents, true);
+
+        if (!is_array($data)) {
+
+            $this->warn('Lockfile is invalid JSON. Ignoring existing file.');
+
+            $this->lockfileData = [];
+
+            return;
+
+        }
+
+        $this->lockfileData = $data;
+
+    }
+
+    protected function writeLockfile(): void
+
+    {
+
+        if ($this->lockfilePath === '') {
+
+            return;
+
+        }
+
+        $directory = dirname($this->lockfilePath);
+
+        if (!is_dir($directory) && !@mkdir($directory, 0775, true) && !is_dir($directory)) {
+
+            $this->warn('Unable to create directory for lockfile: ' . $directory);
+
+            return;
+
+        }
+
+        $payload = [
+
+            'php_version' => $this->selectedPhpExactVersion !== '' ? $this->selectedPhpExactVersion : $this->selectedPhpVersion,
+
+            'base_version' => $this->selectedPhpVersion,
+
+            'extensions' => $this->selectedExtensions,
+
+            'packs' => $this->requestedPacks,
+
+            'profile' => $this->buildProfile,
+
+            'build_flags' => $this->additionalBuildFlags,
+
+            'build_key' => $this->buildHash,
+
+            'updated_at' => date('c'),
+
+        ];
+
+        file_put_contents(
+
+            $this->lockfilePath,
+
+            json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . PHP_EOL
+
+        );
+
+    }
+
+    protected function calculateBuildMatrix(): void
+
+    {
+
+        $extensions = $this->selectedExtensions;
+
+        sort($extensions);
+
+        $this->buildMatrix = [
+
+            'php_version' => $this->selectedPhpExactVersion !== '' ? $this->selectedPhpExactVersion : $this->selectedPhpVersion,
+
+            'php_base_version' => $this->selectedPhpVersion,
+
+            'os_family' => PHP_OS_FAMILY,
+
+            'os_name' => php_uname('s'),
+
+            'architecture' => php_uname('m'),
+
+            'profile' => $this->buildProfile,
+
+            'packs' => $this->requestedPacks,
+
+            'extensions' => $extensions,
+
+            'build_flags' => $this->additionalBuildFlags,
+
+            'mode' => $this->option('mode') ?? 'nativephp',
+
+        ];
+
+    }
+
+    protected function computeBuildHash(array $matrix): string
+
+    {
+
+        return hash('sha256', json_encode($matrix, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+
+    }
+
+    protected function resolveCacheDirectory(?string $override): string
+
+    {
+
+        $directory = $override;
+
+        if ($directory === null || $directory === '') {
+
+            if (function_exists('storage_path')) {
+
+                $directory = storage_path('app/nativephp-ext-cache');
+
+            } else {
+
+                $directory = base_path('storage/nativephp-ext-cache');
+
+            }
+
+        } elseif (!preg_match('/^(?:[A-Za-z]:\\\\|\\/)/', $directory)) {
+
+            $directory = base_path($directory);
+
+        }
+
+        if (!is_dir($directory) && !@mkdir($directory, 0775, true) && !is_dir($directory)) {
+
+            throw new RuntimeException('Unable to create cache directory: ' . $directory);
+
+        }
+
+        foreach (['artifacts', 'meta', 'reports', 'locks'] as $subdir) {
+
+            $path = $directory . DIRECTORY_SEPARATOR . $subdir;
+
+            if (!is_dir($path) && !@mkdir($path, 0775, true) && !is_dir($path)) {
+
+                throw new RuntimeException('Unable to create cache subdirectory: ' . $path);
+
+            }
+
+        }
+
+        return $directory;
+
+    }
+
+    protected function checkCacheForBuild(bool $silent = false): bool
+
+    {
+
+        if ($this->cacheDirectory === null || $this->buildHash === '') {
+
+            return false;
+
+        }
+
+        $metaPath = $this->cacheDirectory . DIRECTORY_SEPARATOR . 'meta' . DIRECTORY_SEPARATOR . $this->buildHash . '.json';
+
+        if (!file_exists($metaPath)) {
+
+            return false;
+
+        }
+
+        $metadata = json_decode((string) file_get_contents($metaPath), true);
+
+        if (!is_array($metadata)) {
+
+            return false;
+
+        }
+
+        $artifactPath = $metadata['artifact_path'] ?? '';
+
+        if (!is_string($artifactPath) || $artifactPath === '' || !file_exists($artifactPath)) {
+
+            return false;
+
+        }
+
+        if (!empty($metadata['checksum'])) {
+
+            $checksum = hash_file('sha256', $artifactPath);
+
+            if ($checksum !== $metadata['checksum']) {
+
+                $this->warn('Cached artifact checksum mismatch. Ignoring cache entry.');
+
+                return false;
+
+            }
+
+        }
+
+        $this->cacheHit = true;
+
+        $this->cachedArtifactPath = $artifactPath;
+
+        $this->buildMetadata = $metadata;
+
+        if (!$silent) {
+
+            $this->info('Cache metadata located for build key ' . $this->buildHash . '.');
+
+        }
+
+        return true;
+
+    }
+
+    protected function announceCacheHit(): void
+
+    {
+
+        $this->cacheHit = true;
+
+        $this->info('✅ Cache hit for build key ' . $this->buildHash . '.');
+
+        if (!empty($this->buildMetadata['artifact_path'])) {
+
+            $this->info('Reusing artifact at ' . $this->buildMetadata['artifact_path']);
+
+        }
+
+    }
+
+    protected function acquireBuildLock(): void
+
+    {
+
+        if ($this->cacheDirectory === null || $this->buildHash === '') {
+
+            return;
+
+        }
+
+        $lockPath = $this->cacheDirectory . DIRECTORY_SEPARATOR . 'locks' . DIRECTORY_SEPARATOR . $this->buildHash . '.lock';
+
+        $handle = fopen($lockPath, 'c');
+
+        if ($handle === false) {
+
+            throw new RuntimeException('Unable to open lock file: ' . $lockPath);
+
+        }
+
+        $this->lockHandle = $handle;
+
+        if (!flock($this->lockHandle, LOCK_EX)) {
+
+            fclose($this->lockHandle);
+
+            $this->lockHandle = null;
+
+            throw new RuntimeException('Unable to acquire build lock for key: ' . $this->buildHash);
+
+        }
+
+    }
+
+    protected function releaseBuildLock(): void
+
+    {
+
+        if ($this->lockHandle === null) {
+
+            return;
+
+        }
+
+        flock($this->lockHandle, LOCK_UN);
+
+        fclose($this->lockHandle);
+
+        $this->lockHandle = null;
+
+    }
+
+    protected function packageBuildArtifacts(string $spcPath): ?array
+
+    {
+
+        if ($this->cacheDirectory === null) {
+
+            return null;
+
+        }
+
+        $buildroot = $spcPath . '/buildroot';
+
+        if (!is_dir($buildroot)) {
+
+            $this->warn('Buildroot directory not found; skipping packaging step.');
+
+            return null;
+
+        }
+
+        $whitelist = $this->getExtensionFileWhitelist();
+
+        $files = $this->gatherPackageFiles($buildroot, $whitelist);
+
+        if (empty($files)) {
+
+            $this->warn('No build artifacts found to package.');
+
+            return null;
+
+        }
+
+        $useZip = PHP_OS_FAMILY === 'Windows' || !class_exists('PharData');
+
+        $artifactExtension = $useZip ? '.zip' : '.tar.gz';
+
+        $artifactDir = $this->cacheDirectory . DIRECTORY_SEPARATOR . 'artifacts';
+
+        $artifactPath = $artifactDir . DIRECTORY_SEPARATOR . $this->buildHash . $artifactExtension;
+
+        if ($useZip) {
+
+            $zip = new ZipArchive();
+
+            if ($zip->open($artifactPath, ZipArchive::CREATE | ZipArchive::OVERWRITE) !== true) {
+
+                throw new RuntimeException('Unable to create ZIP artifact at ' . $artifactPath);
+
+            }
+
+            foreach ($files as $relative => $absolute) {
+
+                if (is_dir($absolute)) {
+
+                    $zip->addEmptyDir($relative);
+
+                    continue;
+
+                }
+
+                $zip->addFile($absolute, $relative);
+
+            }
+
+            $zip->close();
+
+        } else {
+
+            $tarPath = $artifactDir . DIRECTORY_SEPARATOR . $this->buildHash . '.tar';
+
+            if (file_exists($tarPath)) {
+
+                unlink($tarPath);
+
+            }
+
+            $phar = new \PharData($tarPath);
+
+            foreach ($files as $relative => $absolute) {
+
+                if (is_dir($absolute)) {
+
+                    $phar->addEmptyDir($relative);
+
+                } else {
+
+                    $phar->addFile($absolute, $relative);
+
+                }
+
+            }
+
+            $phar->compress(\Phar::GZ);
+
+            unset($phar);
+
+            if (file_exists($tarPath)) {
+
+                unlink($tarPath);
+
+            }
+
+            $artifactPath = $tarPath . '.gz';
+
+        }
+
+        if (!file_exists($artifactPath)) {
+
+            $this->warn('Expected artifact file was not created: ' . $artifactPath);
+
+            return null;
+
+        }
+
+        $checksum = hash_file('sha256', $artifactPath);
+
+        $metadata = [
+
+            'artifact_path' => $artifactPath,
+
+            'checksum' => $checksum,
+
+            'size' => filesize($artifactPath),
+
+            'profile' => $this->buildProfile,
+
+            'packaged_files' => array_keys($files),
+
+        ];
+
+        $reportDir = $this->cacheDirectory . DIRECTORY_SEPARATOR . 'reports';
+
+        $reportPath = $reportDir . DIRECTORY_SEPARATOR . $this->buildHash . '.json';
+
+        file_put_contents($reportPath, json_encode([
+
+            'build_key' => $this->buildHash,
+
+            'matrix' => $this->buildMatrix,
+
+            'files' => array_keys($files),
+
+            'artifact' => $artifactPath,
+
+            'checksum' => $checksum,
+
+            'size' => $metadata['size'],
+
+            'profile' => $this->buildProfile,
+
+            'created_at' => date('c'),
+
+        ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+
+        return $metadata;
+
+    }
+
+    protected function gatherPackageFiles(string $buildroot, array $extensionWhitelist): array
+
+    {
+
+        $buildroot = rtrim(str_replace('\\', '/', $buildroot), '/');
+
+        $targets = [
+
+            'bin/php',
+
+            'bin/php.exe',
+
+            'php.ini',
+
+            'php.ini-development',
+
+            'php.ini-production',
+
+            'conf.d',
+
+            'ext',
+
+            'lib/php/extensions',
+
+        ];
+
+        $files = [];
+
+        foreach ($targets as $target) {
+
+            $absolute = $buildroot . '/' . $target;
+
+            if (!file_exists($absolute)) {
+
+                continue;
+
+            }
+
+            if (is_dir($absolute)) {
+
+                $iterator = new \RecursiveIteratorIterator(
+
+                    new \RecursiveDirectoryIterator($absolute, \FilesystemIterator::SKIP_DOTS),
+
+                    \RecursiveIteratorIterator::SELF_FIRST
+
+                );
+
+                foreach ($iterator as $item) {
+
+                    $relative = substr(str_replace('\\', '/', $item->getPathname()), strlen($buildroot) + 1);
+
+                    if ($this->shouldIncludePathInPackage($relative, $item->isDir(), $extensionWhitelist)) {
+
+                        if ($item->isDir()) {
+
+                            $files[$relative] = $item->getPathname();
+
+                        } else {
+
+                            $files[$relative] = $item->getPathname();
+
+                        }
+
+                    }
+
+                }
+
+            } else {
+
+                $relative = substr(str_replace('\\', '/', $absolute), strlen($buildroot) + 1);
+
+                $files[$relative] = $absolute;
+
+            }
+
+        }
+
+        ksort($files);
+
+        return $files;
+
+    }
+
+    protected function shouldIncludePathInPackage(string $relativePath, bool $isDir, array $extensionWhitelist): bool
+
+    {
+
+        $relativePath = ltrim(str_replace('\\', '/', $relativePath), '/');
+
+        if ($relativePath === '') {
+
+            return false;
+
+        }
+
+        if ($relativePath === 'conf.d' || str_starts_with($relativePath, 'conf.d/')) {
+
+            return true;
+
+        }
+
+        if (in_array($relativePath, ['php.ini', 'php.ini-development', 'php.ini-production'], true)) {
+
+            return true;
+
+        }
+
+        if (str_starts_with($relativePath, 'bin/php')) {
+
+            return !$isDir;
+
+        }
+
+        if ($relativePath === 'ext' || str_starts_with($relativePath, 'ext/') ||
+
+            $relativePath === 'lib/php/extensions' || str_starts_with($relativePath, 'lib/php/extensions')) {
+
+            if ($isDir) {
+
+                return true;
+
+            }
+
+            if (empty($extensionWhitelist)) {
+
+                return true;
+
+            }
+
+            return in_array(strtolower(basename($relativePath)), $extensionWhitelist, true);
+
+        }
+
+        return false;
+
+    }
+
+    protected function getExtensionFileWhitelist(): array
+
+    {
+
+        if ($this->buildProfile === 'full') {
+
+            return [];
+
+        }
+
+        $whitelist = [];
+
+        foreach ($this->selectedExtensions as $extension) {
+
+            $extension = strtolower($extension);
+
+            $whitelist[] = "php_{$extension}.dll";
+
+            $whitelist[] = "php_{$extension}.so";
+
+            $whitelist[] = "{$extension}.dll";
+
+            $whitelist[] = "{$extension}.so";
+
+        }
+
+        return array_values(array_unique($whitelist));
+
+    }
+
+    protected function storeBuildMetadata(array $metadata): void
+
+    {
+
+        if ($this->cacheDirectory === null) {
+
+            return;
+
+        }
+
+        $metaDir = $this->cacheDirectory . DIRECTORY_SEPARATOR . 'meta';
+
+        $metadata = array_merge([
+
+            'build_key' => $this->buildHash,
+
+            'matrix' => $this->buildMatrix,
+
+            'profile' => $this->buildProfile,
+
+            'packs' => $this->requestedPacks,
+
+            'build_flags' => $this->additionalBuildFlags,
+
+        ], $metadata);
+
+        $metadata['updated_at'] = date('c');
+
+        file_put_contents($metaDir . DIRECTORY_SEPARATOR . $this->buildHash . '.json', json_encode(
+
+            $metadata,
+
+            JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES
+
+        ));
+
+        $this->buildMetadata = $metadata;
+
+        $this->cachedArtifactPath = $metadata['artifact_path'] ?? null;
+
+    }
+
+    protected function emitJsonSummary(string $status, array $extra = []): void
+
+    {
+
+        if (!$this->jsonOutput) {
+
+            return;
+
+        }
+
+        $payload = array_merge([
+
+            'status' => $status,
+
+            'build_key' => $this->buildHash,
+
+            'php_version' => $this->selectedPhpExactVersion !== '' ? $this->selectedPhpExactVersion : $this->selectedPhpVersion,
+
+            'extensions' => $this->selectedExtensions,
+
+            'packs' => $this->requestedPacks,
+
+            'profile' => $this->buildProfile,
+
+            'build_flags' => $this->additionalBuildFlags,
+
+            'cache_hit' => $this->cacheHit,
+
+            'dry_run' => $this->dryRun,
+
+            'artifact' => $this->cachedArtifactPath,
+
+            'checksum' => $this->buildMetadata['checksum'] ?? null,
+
+            'lockfile' => $this->lockfilePath,
+
+        ], $extra);
+
+        $this->line(json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+
+    }
+
+    protected function outputResolvedConfiguration(): void
+
+    {
+
+        $this->info('=== Build Configuration ===');
+
+        $this->info('Build key: ' . $this->buildHash);
+
+        $this->info('PHP version: ' . ($this->selectedPhpExactVersion !== '' ? $this->selectedPhpExactVersion : $this->selectedPhpVersion));
+
+        $this->info('Profile: ' . ucfirst($this->buildProfile));
+
+        if (!empty($this->requestedPacks)) {
+
+            $this->info('Extension packs: ' . implode(', ', $this->requestedPacks));
+
+        }
+
+        $this->info('Extensions (' . count($this->selectedExtensions) . '): ' . implode(', ', $this->selectedExtensions));
+
+        if (!empty($this->additionalBuildFlags)) {
+
+            $this->info('Additional build flags: ' . implode(' ', $this->additionalBuildFlags));
+
+        }
+
+        if (!empty($this->buildMetadata['artifact_path'])) {
+
+            $this->info('Cached artifact: ' . $this->buildMetadata['artifact_path']);
 
         }
 
