@@ -1247,6 +1247,86 @@ class InstallPhpExtensions extends Command
 
         }
 
+        // Check for Perl (required for OpenSSL compilation)
+
+        $this->validatePerl();
+
+    }
+
+    protected function validatePerl(): void
+
+    {
+
+        // Check if Perl is available
+
+        $perlCheck = Process::run('perl --version');
+
+        if (!$perlCheck->successful()) {
+
+            $this->error('Perl is not installed or not in PATH.');
+
+            $this->line('');
+
+            $this->line('OpenSSL compilation requires Perl. Please install Strawberry Perl:');
+
+            $this->line('1. Download from: https://strawberryperl.com/');
+
+            $this->line('2. Run the installer (it will add Perl to PATH automatically)');
+
+            $this->line('3. Restart your terminal');
+
+            $this->line('4. Retry this command');
+
+            throw new RuntimeException('Perl is required for building PHP with OpenSSL support.');
+
+        }
+
+        // Get Perl executable path
+
+        $perlPath = trim(Process::run('where perl')->output());
+
+        $perlPath = explode("\n", $perlPath)[0]; // Get first match
+
+        // Check if Perl path contains spaces (Git's Perl in "Program Files" will fail)
+
+        if (str_contains($perlPath, ' ')) {
+
+            $this->warn('⚠️  WARNING: Perl path contains spaces: ' . $perlPath);
+
+            $this->line('');
+
+            $this->line('This may cause OpenSSL build failures on Windows.');
+
+            $this->line('Git\'s Perl ("C:\\Program Files\\Git\\usr\\bin\\perl.exe") has spaces in the path,');
+
+            $this->line('which causes Windows command line issues during OpenSSL compilation.');
+
+            $this->line('');
+
+            $this->line('RECOMMENDED SOLUTION: Install Strawberry Perl');
+
+            $this->line('1. Download from: https://strawberryperl.com/');
+
+            $this->line('2. Run the installer (installs to C:\\Strawberry\\perl\\bin\\perl.exe - no spaces)');
+
+            $this->line('3. Restart your terminal (Strawberry Perl will be used automatically)');
+
+            $this->line('4. Retry this command');
+
+            $this->line('');
+
+            if (!$this->confirm('Do you want to continue anyway? (Build may fail at OpenSSL compilation)', false)) {
+
+                throw new RuntimeException('Build cancelled. Please install Strawberry Perl and retry.');
+
+            }
+
+        } else {
+
+            $this->info('✓ Perl found: ' . $perlPath);
+
+        }
+
     }
 
     protected function getUserPreferences(): void

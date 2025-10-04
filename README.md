@@ -23,6 +23,11 @@ A Laravel package that provides a powerful command-line tool to build custom sta
 - **Composer** - PHP dependency management
 
 ### For Building Custom PHP Binaries (Windows)
+- **Strawberry Perl** - Required for OpenSSL compilation
+  - ⚠️ **CRITICAL**: Git's Perl has spaces in path and will cause build failures
+  - Download from: https://strawberryperl.com/
+  - Installs to `C:\Strawberry\perl\bin\perl.exe` (no spaces in path)
+  - Auto-detected and validated before build starts
 - **Python 3.8+** - Used for reliable tar.gz/tar.xz extraction on Windows
   - Handles archives with symlinks gracefully
   - Install from: https://www.python.org/downloads/
@@ -269,6 +274,23 @@ php -d memory_limit=512M artisan php-ext:install
 2. Select "Add CMake to system PATH" during installation
 3. Restart terminal
 4. Verify: `cmake --version`
+
+### OpenSSL Build Failure - Perl Path Error
+```
+'C:\Program' is not recognized as an internal or external command
+```
+**Cause**: Git's Perl has spaces in path (`C:\Program Files\Git\usr\bin\perl.exe`)
+
+**Solution**: Install Strawberry Perl (REQUIRED)
+1. Download from https://strawberryperl.com/
+2. Run installer (adds to PATH automatically)
+3. Restart terminal
+4. Verify: `perl --version` should show Strawberry Perl
+5. Retry build
+
+**Why This Works**: Strawberry Perl installs to `C:\Strawberry\perl\bin\perl.exe` (no spaces), which Windows can execute properly during OpenSSL compilation.
+
+**Auto-Detection**: The package now detects Perl path issues and warns you before build starts.
 
 ### Version Resolution Failed
 ```
