@@ -399,5 +399,6 @@ This package is open-sourced software licensed under the [MIT license](LICENSE).
 ## Support
 
 - 📖 [Documentation](https://github.com/Abdallah-Tah/nativephp-ext-cli)
+- 📚 [SPC build optimization playbook](docs/spc-build-optimization.md)
 - 🐛 [Issue Tracker](https://github.com/Abdallah-Tah/nativephp-ext-cli/issues)
 - 💬 [Discussions](https://github.com/Abdallah-Tah/nativephp-ext-cli/discussions)
