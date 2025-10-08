@@ -777,9 +777,9 @@ class InstallPhpExtensions extends Command
 
         if (!file_exists($spcPath)) {
 
-            $this->info('Cloning static-php-cli repository...');
+            $this->info('Cloning static-php-cli repository (shallow clone for faster download)...');
 
-            $cloneResult = Process::run("git clone https://github.com/crazywhalecc/static-php-cli.git \"{$spcPath}\"");
+            $cloneResult = Process::timeout(180)->run("git clone --depth=1 https://github.com/crazywhalecc/static-php-cli.git \"{$spcPath}\"");
 
             if (!$cloneResult->successful()) {
 
