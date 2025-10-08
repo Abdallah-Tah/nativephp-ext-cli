@@ -3149,25 +3149,21 @@ protected function ensureGitDependencies(string $spcPath): void
 
             }
 
-            // Check if extraction is incomplete (only has .spc-hash and build directory)
+            // Check if extraction is incomplete
 
             if (file_exists($targetPath)) {
 
                 $contents = scandir($targetPath);
 
-                $realContents = array_diff($contents, ['.', '..']);
+                $realContents = array_diff($contents, ['.', '..', 'build', '.spc-hash']);
 
                 $isIncomplete = false;
 
-                // If directory only contains .spc-hash and build/, it's incomplete
+                // If directory only contains build/ and .spc-hash (no actual source files), it's incomplete
 
-                if (
+                if (count($realContents) === 0) {
 
-                    count($realContents) <= 2 &&
-
-                    (in_array('.spc-hash', $realContents) || in_array('build', $realContents))
-
-                ) {
+                    $this->warn("{$depName} directory exists but contains no source files (only build/.spc-hash)");
 
                     $isIncomplete = true;
 
@@ -3185,7 +3181,7 @@ protected function ensureGitDependencies(string $spcPath): void
 
                         foreach ($expectedFiles as $expectedFile) {
 
-                            if (!in_array($expectedFile, $realContents) && !file_exists($targetPath . '/' . $expectedFile)) {
+                            if (!file_exists($targetPath . '/' . $expectedFile)) {
 
                                 $missingFiles[] = $expectedFile;
 
@@ -3244,6 +3240,10 @@ protected function ensureGitDependencies(string $spcPath): void
     protected function reExtractTarDependency(string $downloadsPath, string $sourcePath, string $depName): void
 
     {
+
+        // Extract spcPath from sourcePath (remove trailing /source)
+
+        $spcPath = dirname($sourcePath);
 
         $targetPath = $sourcePath . '/' . $depName;
 
@@ -3437,6 +3437,10 @@ protected function ensureGitDependencies(string $spcPath): void
 
             $this->verifyTarExtraction($targetPath, $depName);
 
+            // Create hash file to prevent re-extraction
+
+            $this->createSourceHashFile($spcPath, $depName, $archiveFile);
+
         } else {
 
             $this->warn("  ⚠️ Failed to extract {$depName}: " . $extractResult->errorOutput());
@@ -3445,7 +3449,7 @@ protected function ensureGitDependencies(string $spcPath): void
 
             $this->info("  - Trying Windows-optimized tar extraction...");
 
-            $windowsOptimizedResult = $this->tryWindowsOptimizedExtraction($archiveFile, $targetPath, $depName);
+            $windowsOptimizedResult = $this->tryWindowsOptimizedExtraction($archiveFile, $targetPath, $depName, $spcPath);
 
             if (!$windowsOptimizedResult) {
 
@@ -3453,7 +3457,7 @@ protected function ensureGitDependencies(string $spcPath): void
 
                 $this->info("  - Trying 7-zip extraction method...");
 
-                $sevenZipResult = $this->trySevenZipExtraction($archiveFile, $targetPath, $depName);
+                $sevenZipResult = $this->trySevenZipExtraction($archiveFile, $targetPath, $depName, $spcPath);
 
                 if (!$sevenZipResult) {
 
@@ -3495,6 +3499,10 @@ protected function ensureGitDependencies(string $spcPath): void
 
                                 $this->verifyTarExtraction($targetPath, $depName);
 
+                                // Create hash file to prevent re-extraction
+
+                                $this->createSourceHashFile($spcPath, $depName, $archiveFile);
+
                             } else {
 
                                 $this->error("  ❌ All extraction methods failed for {$depName}");
@@ -3513,7 +3521,7 @@ protected function ensureGitDependencies(string $spcPath): void
 
     }
 
-    protected function tryWindowsOptimizedExtraction(string $archiveFile, string $targetPath, string $depName): bool
+    protected function tryWindowsOptimizedExtraction(string $archiveFile, string $targetPath, string $depName, string $spcPath): bool
 
     {
 
@@ -3570,6 +3578,10 @@ protected function ensureGitDependencies(string $spcPath): void
             $this->info("  ✅ {$depName} extracted with Windows-optimized method");
 
             $this->verifyTarExtraction($targetPath, $depName);
+
+            // Create hash file to prevent re-extraction
+
+            $this->createSourceHashFile($spcPath, $depName, $archiveFile);
 
             return true;
 
@@ -3643,7 +3655,7 @@ protected function ensureGitDependencies(string $spcPath): void
 
     }
 
-    protected function trySevenZipExtraction(string $archiveFile, string $targetPath, string $depName): bool
+    protected function trySevenZipExtraction(string $archiveFile, string $targetPath, string $depName, string $spcPath): bool
 
     {
 
@@ -3692,6 +3704,10 @@ protected function ensureGitDependencies(string $spcPath): void
             $this->handleBasicExtractionCleanup($targetPath, $depName);
 
             $this->verifyTarExtraction($targetPath, $depName);
+
+            // Create hash file to prevent re-extraction
+
+            $this->createSourceHashFile($spcPath, $depName, $archiveFile);
 
             return true;
 
