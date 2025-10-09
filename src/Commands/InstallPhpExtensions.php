@@ -731,6 +731,10 @@ class InstallPhpExtensions extends Command
 
                 $this->writeLockfile();
 
+                // Deploy to NativePHP if the package exists
+
+                $this->deployToNativePHP();
+
                 $this->emitJsonSummary('built');
 
                 return self::SUCCESS;
@@ -1099,43 +1103,46 @@ class InstallPhpExtensions extends Command
 
         }
 
-        // Download each required library (these provide the underlying functionality for extensions)
+        // Use static-php-cli's recommended --for-extensions download method
+        // This automatically downloads all required libraries and dependencies
 
-        $this->info('Downloading required libraries for extensions...');
+        $this->info('Downloading sources and libraries using --for-extensions (recommended method)...');
 
-        $this->line('Libraries provide the underlying functionality for extensions like openssl, curl, sqlite, etc.');
+        $this->line('This will automatically download all extensions and their required libraries.');
 
-        $this->line('🔄 Enhanced download with GitHub fallback: If standard download fails, will automatically clone from GitHub.');
+        $extensionsList = implode(',', $this->selectedExtensions);
 
-        $this->displayLibraryExtensionMapping();
+        $downloadCommand = "php bin/spc download --for-extensions={$extensionsList} --with-php={$this->selectedPhpVersion}";
 
-        foreach ($this->requiredLibraries as $lib) {
+        $this->line("Running: {$downloadCommand}");
 
-            $this->info("Downloading library: {$lib}...");
+        $downloadResult = Process::path($spcPath)
 
-            $downloaded = $this->downloadLibraryWithFallback($spcPath, $lib);
+            ->timeout(600)
 
-            if (!$downloaded) {
+            ->env($this->getSpcEnvironment())
 
-                if (!$this->confirm("Failed to download {$lib} using all methods. Continue anyway?")) {
+            ->run($downloadCommand);
 
-                    throw new RuntimeException("Cannot continue without {$lib}");
+        if (!$downloadResult->successful()) {
 
-                }
+            $this->error('Failed to download dependencies using --for-extensions method');
 
-            }
+            $this->warn('Output: ' . $downloadResult->output());
+
+            $this->warn('Error: ' . $downloadResult->errorOutput());
+
+            throw new RuntimeException('Failed to download required dependencies');
 
         }
 
-        // CRITICAL: Ensure tar-based extractions are complete AFTER downloading libraries
+        $this->info('✅ All dependencies downloaded successfully');
+
+        // CRITICAL: Ensure tar-based extractions are complete AFTER downloading
 
         $this->info('Verifying tar-based extractions...');
 
         $this->ensureTarBasedExtractions($spcPath);
-
-        // CRITICAL: Pre-extract problematic libraries using Python (symlink-safe, Windows-compatible)
-
-        $this->extractLibrariesWindows($spcPath);
 
     }
 
@@ -5916,6 +5923,130 @@ protected function ensureGitDependencies(string $spcPath): void
         if (!empty($this->buildMetadata['artifact_path'])) {
 
             $this->info('Cached artifact: ' . $this->buildMetadata['artifact_path']);
+
+        }
+
+    }
+
+    protected function deployToNativePHP(): void
+
+    {
+
+        // Check if NativePHP php-bin package is installed
+
+        $nativePHPPath = base_path('vendor/nativephp/php-bin/bin');
+
+        if (!is_dir($nativePHPPath)) {
+
+            $this->line('ℹ️  NativePHP php-bin package not found, skipping deployment');
+
+            return;
+
+        }
+
+        // Determine system PHP version for deployment filename
+
+        $phpMajorMinor = PHP_MAJOR_VERSION . '.' . PHP_MINOR_VERSION;
+
+        // Determine platform-specific path
+
+        $platform = match (PHP_OS_FAMILY) {
+
+            'Windows' => 'win',
+
+            'Darwin' => 'mac',
+
+            'Linux' => 'linux',
+
+            default => null
+
+        };
+
+        $arch = match (php_uname('m')) {
+
+            'x86_64', 'AMD64' => 'x64',
+
+            'arm64', 'aarch64' => 'arm64',
+
+            default => 'x64'
+
+        };
+
+        if (!$platform) {
+
+            $this->warn('⚠️  Unknown platform, skipping NativePHP deployment');
+
+            return;
+
+        }
+
+        $targetDir = base_path("vendor/nativephp/php-bin/bin/{$platform}/{$arch}");
+
+        if (!is_dir($targetDir)) {
+
+            $this->warn("⚠️  NativePHP target directory not found: {$targetDir}");
+
+            return;
+
+        }
+
+        // Get the artifact path
+
+        if (empty($this->buildMetadata['artifact_path'])) {
+
+            $this->warn('⚠️  No artifact path found, skipping NativePHP deployment');
+
+            return;
+
+        }
+
+        $artifactPath = $this->buildMetadata['artifact_path'];
+
+        if (!file_exists($artifactPath)) {
+
+            $this->warn("⚠️  Artifact not found at: {$artifactPath}");
+
+            return;
+
+        }
+
+        // Deploy with PHP version naming convention
+
+        $targetFile = "{$targetDir}/php-{$phpMajorMinor}.zip";
+
+        $this->info("📦 Deploying custom PHP binary to NativePHP...");
+
+        $this->line("   Source: {$artifactPath}");
+
+        $this->line("   Target: {$targetFile}");
+
+        // Backup original if it exists
+
+        if (file_exists($targetFile)) {
+
+            $backupFile = "{$targetDir}/php-{$phpMajorMinor}-original.zip";
+
+            if (!file_exists($backupFile)) {
+
+                copy($targetFile, $backupFile);
+
+                $this->line("   Backed up original to: {$backupFile}");
+
+            }
+
+        }
+
+        // Copy artifact
+
+        if (copy($artifactPath, $targetFile)) {
+
+            $this->info("✅ Successfully deployed to NativePHP!");
+
+            $this->line("   NativePHP will now use your custom PHP binary with MySQL support");
+
+        } else {
+
+            $this->error("❌ Failed to deploy to NativePHP");
 
         }
 
