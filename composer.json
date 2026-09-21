@@ -21,8 +21,8 @@
         }
     ],
     "support": {
-        "issues": "https://github.com/Abdallah-Tah/php-extension-builder-nativephp/issues",
-        "source": "https://github.com/Abdallah-Tah/php-extension-builder-nativephp"
+        "issues": "https://github.com/Abdallah-Tah/nativephp-ext-cli/issues",
+        "source": "https://github.com/Abdallah-Tah/nativephp-ext-cli"
     },
     "autoload": {
         "psr-4": {
@@ -72,7 +72,7 @@
     "repositories": [
         {
             "type": "vcs",
-            "url": "https://github.com/Abdallah-Tah/php-extension-builder-nativephp"
+            "url": "https://github.com/Abdallah-Tah/nativephp-ext-cli"
         }
     ]
 }

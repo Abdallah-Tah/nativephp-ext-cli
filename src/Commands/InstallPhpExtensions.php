@@ -2,6 +2,11 @@
 
 namespace Amohamed\NativePhpCustomPhp\Commands;
 
+use Amohamed\NativePhpCustomPhp\Drivers\DriverRegistry;
+use Amohamed\NativePhpCustomPhp\Php\PhpNetReleaseLookup;
+use Amohamed\NativePhpCustomPhp\Php\PhpVersionResolver;
+use Amohamed\NativePhpCustomPhp\Php\SupportedPhpVersions;
+use Amohamed\NativePhpCustomPhp\Platform\PlatformDetector;
 use Illuminate\Console\Command;
 
 use Illuminate\Support\Facades\Process;
@@ -550,6 +555,12 @@ class InstallPhpExtensions extends Command
      */
     protected array $buildMetadata = [];
 
+    protected PhpVersionResolver $phpVersionResolver;
+
+    protected PlatformDetector $platformDetector;
+
+    protected DriverRegistry $driverRegistry;
+
     // Default extensions - matches NativePHP php-bin exactly
     // This ensures compatibility and faster builds when using --mode=nativephp
     protected array $defaultExtensions = [
@@ -587,6 +598,10 @@ class InstallPhpExtensions extends Command
     {
 
         parent::__construct();
+
+        $this->phpVersionResolver = new PhpVersionResolver(new PhpNetReleaseLookup());
+        $this->platformDetector = new PlatformDetector();
+        $this->driverRegistry = new DriverRegistry();
     }
 
     public function handle(): int
@@ -1664,6 +1679,25 @@ class InstallPhpExtensions extends Command
     protected function validateEnvironment(): void
 
     {
+        foreach (['mbstring', 'tokenizer'] as $ext) {
+
+            if (!extension_loaded($ext)) {
+
+                throw new RuntimeException("PHP Extension {$ext} is required.");
+            }
+        }
+
+        if ($this->dryRun) {
+            if (version_compare(PHP_VERSION, '8.1.0', '<')) {
+                throw new RuntimeException('PHP >= 8.1 required.');
+            }
+
+            if (PHP_OS_FAMILY !== 'Windows') {
+                $this->warn('Dry run note: local build execution remains Windows-only in this release.');
+            }
+
+            return;
+        }
 
         if (PHP_OS_FAMILY !== 'Windows') {
 
@@ -1673,14 +1707,6 @@ class InstallPhpExtensions extends Command
         if (version_compare(PHP_VERSION, '8.1.0', '<')) {
 
             throw new RuntimeException('PHP >= 8.1 required.');
-        }
-
-        foreach (['mbstring', 'tokenizer'] as $ext) {
-
-            if (!extension_loaded($ext)) {
-
-                throw new RuntimeException("PHP Extension {$ext} is required.");
-            }
         }
 
         // Check for Visual Studio
@@ -1817,9 +1843,9 @@ class InstallPhpExtensions extends Command
 
         if (!$phpVersion) {
 
-            $this->info('Common PHP versions: 8.1, 8.2, 8.3, 8.4');
+            $this->info('Common PHP versions: ' . implode(', ', SupportedPhpVersions::minors()));
 
-            $this->warn('Note: PHP 8.4 does not support SQL Server extensions (sqlsrv, pdo_sqlsrv)');
+            $this->warn('Note: PHP 8.4+ does not support SQL Server extensions (sqlsrv, pdo_sqlsrv)');
 
             $this->line('');
 
@@ -1829,9 +1855,9 @@ class InstallPhpExtensions extends Command
 
                 'Select PHP version to build:',
 
-                ['8.1', '8.2', '8.3', '8.4', 'custom'],
+                array_merge(SupportedPhpVersions::minors(), ['custom']),
 
-                '8.3'
+                config('nativephp-custom-php.default_php_version', '8.5')
 
             );
 
@@ -1850,61 +1876,17 @@ class InstallPhpExtensions extends Command
             }
         }
 
-        // Validate PHP version is supported (8.1+)
+        $resolvedVersion = $this->phpVersionResolver->resolve((string) $phpVersion);
 
-        if (version_compare($phpVersion, '8.1', '<')) {
+        $this->selectedPhpVersion = $resolvedVersion->minor;
+        $this->selectedPhpExactVersion = $resolvedVersion->resolved;
+        $this->phpReleaseMetadata = $resolvedVersion->sources;
 
-            throw new RuntimeException('PHP version must be 8.1 or higher');
-        }
-
-        $versionMatch = [];
-
-        if (!preg_match('/^(?<major>\d+)\.(?<minor>\d+)(?:\.(?<patch>\d+))?$/', $phpVersion, $versionMatch)) {
-
-            throw new RuntimeException('Invalid PHP version format. Use format: 8.3 or 8.3.13');
-        }
-
-        $baseVersion = $versionMatch['major'] . '.' . $versionMatch['minor'];
-
-        $this->selectedPhpVersion = $baseVersion;
-
-        $patchProvided = isset($versionMatch['patch']) && $versionMatch['patch'] !== '';
-
-        if ($patchProvided) {
-
-            $this->selectedPhpExactVersion = $phpVersion;
-
-            $this->phpReleaseMetadata = [];
-        } else {
-
-            $releaseInfo = $this->resolvePhpReleaseMetadata($baseVersion);
-
-            if ($releaseInfo !== null) {
-
-                $this->selectedPhpExactVersion = $releaseInfo['version'];
-
-                $this->phpReleaseMetadata = $releaseInfo['sources'];
-
-                $this->info("Resolved latest PHP {$baseVersion} release: {$this->selectedPhpExactVersion}");
+        if (!$resolvedVersion->exactRequested) {
+            if ($resolvedVersion->fromNetwork) {
+                $this->info("Resolved latest PHP {$resolvedVersion->minor} release: {$resolvedVersion->resolved}");
             } else {
-
-                // API call failed - use known latest versions as fallback
-                $knownLatestVersions = [
-                    '8.1' => '8.1.31',
-                    '8.2' => '8.2.29',
-                    '8.3' => '8.3.15',
-                    '8.4' => '8.4.13',
-                ];
-
-                if (isset($knownLatestVersions[$baseVersion])) {
-                    $this->selectedPhpExactVersion = $knownLatestVersions[$baseVersion];
-                    $this->warn("Could not reach PHP.net API. Using known latest version: {$this->selectedPhpExactVersion}");
-                } else {
-                    $this->selectedPhpExactVersion = $baseVersion . '.0';
-                    $this->warn("Could not determine latest PHP {$baseVersion} release. Using {$this->selectedPhpExactVersion}");
-                }
-
-                $this->phpReleaseMetadata = [];
+                $this->warn("Could not reach PHP.net API. Using known latest version: {$resolvedVersion->resolved}");
             }
         }
 
@@ -2467,8 +2449,10 @@ class InstallPhpExtensions extends Command
             'postgres' => 'PostgreSQL (includes pgsql + pdo_pgsql)',
         ];
 
-        // Add SQL Server option only for compatible PHP versions
-        if (version_compare($this->selectedPhpVersion, '8.4', '<')) {
+        $detectedPlatform = $this->platformDetector->detect()->platform;
+
+        // Add SQL Server option only for compatible PHP versions on Windows.
+        if (version_compare($this->selectedPhpVersion, '8.4', '<') && $detectedPlatform === 'win') {
             $databaseTypes['sqlserver'] = 'SQL Server (includes sqlsrv + pdo_sqlsrv)';
         }
 
@@ -2524,14 +2508,10 @@ class InstallPhpExtensions extends Command
     }
 
     protected function normalizeDatabaseDriverName(string $driver): ?string
+
     {
 
-        return match (strtolower(trim($driver))) {
-            'mysql', 'mysqli', 'pdo_mysql' => 'mysql',
-            'pgsql', 'postgres', 'postgresql', 'pdo_pgsql' => 'postgres',
-            'sqlsrv', 'sqlserver', 'pdo_sqlsrv' => 'sqlserver',
-            default => null,
-        };
+        return $this->driverRegistry->normalize($driver);
     }
 
     protected function mapDatabaseTypesToExtensions(array $databaseTypes, bool $silent = false): array
@@ -2540,6 +2520,7 @@ class InstallPhpExtensions extends Command
 
         $extensions = [];
         $processed = [];
+        $detectedPlatform = $this->platformDetector->detect()->platform;
 
         foreach ($databaseTypes as $type) {
 
@@ -2560,60 +2541,25 @@ class InstallPhpExtensions extends Command
 
             $processed[$normalized] = true;
 
-            switch ($normalized) {
+            $driverExtensions = $this->driverRegistry->extensionsFor(
+                $normalized,
+                $this->selectedPhpVersion,
+                $detectedPlatform
+            );
 
-                case 'mysql':
+            if (empty($driverExtensions)) {
+                if (!$silent && $normalized === 'sqlserver' && version_compare($this->selectedPhpVersion, '8.4', '>=')) {
+                    $this->warn('SQL Server extensions are not supported in PHP 8.4+');
+                } elseif (!$silent && $normalized === 'sqlserver' && $detectedPlatform !== 'win') {
+                    $this->warn('SQL Server extensions currently require a Windows target platform.');
+                }
+                continue;
+            }
 
-                    $extensions = array_merge($extensions, $this->databaseDriverExtensionMap['mysql']);
+            $extensions = array_merge($extensions, $driverExtensions);
 
-                    if (!$silent) {
-                        $this->info('Adding MySQL extensions: mysqli, pdo_mysql');
-                    }
-
-                    break;
-
-                case 'postgres':
-
-                    [$pgsqlExtension, $pdoExtension] = $this->databaseDriverExtensionMap['postgres'] + [null, null];
-
-                    if ($pgsqlExtension !== null) {
-                        $extensions[] = $pgsqlExtension;
-                    }
-
-                    if ($pdoExtension !== null && isset($this->availableExtensions[$pdoExtension])) {
-
-                        $extensions[] = $pdoExtension;
-
-                        if (!$silent) {
-                            $this->info('Adding PostgreSQL extensions: pgsql, pdo_pgsql');
-                        }
-                    } else {
-
-                        if (!$silent) {
-                            $this->info('Adding PostgreSQL extensions: pgsql');
-                            $this->warn('Note: pdo_pgsql may not be available in static-php-cli');
-                        }
-                    }
-
-                    break;
-
-                case 'sqlserver':
-
-                    if (version_compare($this->selectedPhpVersion, '8.4', '<')) {
-
-                        $extensions = array_merge($extensions, $this->databaseDriverExtensionMap['sqlserver']);
-
-                        if (!$silent) {
-                            $this->info('Adding SQL Server extensions: sqlsrv, pdo_sqlsrv');
-                        }
-                    } else {
-
-                        if (!$silent) {
-                            $this->warn('SQL Server extensions are not supported in PHP 8.4+');
-                        }
-                    }
-
-                    break;
+            if (!$silent) {
+                $this->info('Adding ' . ucfirst($normalized) . ' extensions: ' . implode(', ', $driverExtensions));
             }
         }
 
@@ -2707,7 +2653,20 @@ class InstallPhpExtensions extends Command
 
             $extInfo = $this->availableExtensions[$ext];
 
-            if (!in_array($this->selectedPhpVersion, $extInfo['php_versions'])) {
+            $supportedVersions = $extInfo['php_versions'] ?? [];
+            $isCompatible = in_array($this->selectedPhpVersion, $supportedVersions, true);
+
+            if (!$isCompatible && !empty($supportedVersions)) {
+                $maxSupportedVersion = max($supportedVersions);
+                if (
+                    version_compare($this->selectedPhpVersion, $maxSupportedVersion, '>')
+                    && !in_array($ext, ['sqlsrv', 'pdo_sqlsrv'], true)
+                ) {
+                    $isCompatible = true;
+                }
+            }
+
+            if (!$isCompatible) {
 
                 $this->warn("Extension '{$ext}' is not compatible with PHP {$this->selectedPhpVersion}. Skipping...");
 
@@ -5546,6 +5505,7 @@ PYTHON;
     protected function calculateBuildMatrix(): void
 
     {
+        $detectedPlatform = $this->platformDetector->detect();
 
         $extensions = $this->selectedExtensions;
 
@@ -5557,11 +5517,15 @@ PYTHON;
 
             'php_base_version' => $this->selectedPhpVersion,
 
-            'os_family' => PHP_OS_FAMILY,
+            'os_family' => $detectedPlatform->family,
 
             'os_name' => php_uname('s'),
 
             'architecture' => php_uname('m'),
+
+            'target_platform' => $detectedPlatform->platform,
+
+            'target_architecture' => $detectedPlatform->architecture,
 
             'profile' => $this->buildProfile,
 
@@ -6138,6 +6102,17 @@ PYTHON;
 
             $this->info('Cached artifact: ' . $this->buildMetadata['artifact_path']);
         }
+    }
+
+    protected function detectOS(): string
+    {
+        $platform = $this->platformDetector->detect()->platform;
+
+        return match ($platform) {
+            'win' => 'Windows',
+            'mac' => 'macOS',
+            default => 'Linux',
+        };
     }
 
     protected function deployToNativePHP(): void
