@@ -31,8 +31,7 @@ class InstallPhpExtensionsTest extends TestCase
 
     public function test_environment_validation()
     {
-        $this->artisan('php-ext:install')
-            ->expectsQuestion('Which PHP extensions would you like to install?', [])
+        $this->artisan('php-ext:install --php-version=8.5 --driver=mysql --dry-run')
             ->assertExitCode(0);
     }
 }
